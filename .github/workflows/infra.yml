@@ -1,0 +1,133 @@
+name: Provision Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/ecr/**"
+      - "terraform/eks/**"
+      - "argocd/**"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action (apply or destroy)"
+        required: true
+        default: "apply"
+        type: choice
+        options:
+          - apply
+          - destroy
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  TF_ACTION: ${{ github.event.inputs.action || 'apply' }}
+
+jobs:
+  ecr:
+    name: ECR - Terraform ${{ github.event.inputs.action || 'apply' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/ecr
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+      - name: Terraform Init
+        run: terraform init
+      - name: Terraform Plan
+        if: env.TF_ACTION == 'apply'
+        run: terraform plan -out=tfplan
+      - name: Terraform Apply
+        if: env.TF_ACTION == 'apply'
+        run: terraform apply -auto-approve tfplan
+      - name: Terraform Destroy
+        if: env.TF_ACTION == 'destroy'
+        run: terraform destroy -auto-approve
+
+  eks:
+    name: EKS - Terraform ${{ github.event.inputs.action || 'apply' }}
+    needs: ecr
+    if: ${{ (github.event.inputs.action || 'apply') == 'apply' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/eks
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+      - name: Terraform Init
+        run: terraform init
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+  eks-destroy:
+    name: EKS - Terraform destroy
+    needs: ecr
+    if: ${{ (github.event.inputs.action || 'apply') == 'destroy' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/eks
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+      - name: Terraform Init
+        run: terraform init
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+
+  deploy-argocd:
+    name: Deploy ArgoCD
+    needs: eks
+    if: ${{ (github.event.inputs.action || 'apply') == 'apply' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name my-eks-cluster --region ${{ env.AWS_REGION }}
+      - name: Install ArgoCD
+        run: |
+          kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+          kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+      - name: Apply ArgoCD Application
+        run: kubectl apply -f argocd/application.yaml
